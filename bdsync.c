@@ -79,6 +79,8 @@
 #define ARCHVER "BDSYNC 0.3"
 #define PROTOVER "0.5"
 
+extern int checkzero (void *p, int len);
+
 void set_blocking(int fd)
 {
         int val;
@@ -218,13 +220,13 @@ static struct zero_hash *pzeroes      = NULL;
 static off64_t          zeroblocksize = 0;
 static unsigned char    *zeroblock    = NULL; 
 
-static struct zero_hash *find_zero_hash (const char *name, off64_t blocksize)
+static struct zero_hash *find_zero_hash (const char *name, off64_t blocksize, int saltsize, unsigned char *salt)
 {
     struct zero_hash *pzh = pzeroes;
     hash_ctx         ctx;
     int              hs;
 
-    verbose (3, "find_zero_hash: name=%s: blocksize=%lld\n", name, blocksize);
+    verbose (3, "find_zero_hash: name=%s: blocksize=%lld, salt=%p\n", name, blocksize, salt);
 
     while (pzh) {
         if (!strcmp (pzh->name, name) && pzh->blocksize == blocksize) return pzh;
@@ -237,7 +239,6 @@ static struct zero_hash *find_zero_hash (const char *name, off64_t blocksize)
     }
     ctx = _init_cs (name, &hs);
 
-
     pzh     = pzeroes;
     pzeroes = malloc (sizeof (struct zero_hash));
 
@@ -247,6 +248,7 @@ static struct zero_hash *find_zero_hash (const char *name, off64_t blocksize)
     pzeroes->hashsize  = hs;
     pzeroes->hash      = malloc (hs);
 
+    hash_update (ctx, salt,      saltsize);
     hash_update (ctx, zeroblock, blocksize);
     hash_finish (ctx, pzeroes->hash);
 
@@ -850,7 +852,6 @@ char *bytes2str (size_t s, unsigned char *p)
 
 int send_digests (struct wr_queue *pqueue, int saltsize, unsigned char *salt, char *digest, char *checksum)
 {
-    char       *tmp = bytes2str (saltsize, salt);
     char       *cp, *buf;
     const char *tchecksum;
     size_t     buflen;
@@ -866,10 +867,12 @@ int send_digests (struct wr_queue *pqueue, int saltsize, unsigned char *salt, ch
         exit (1);
     }
 
-    verbose (1, "send_digests: salt = %s, digest = %s, checksum = %s\n"
-              , tmp, digest, (checksum ? checksum : "(none)"));
-
-    free (tmp);
+    if (isverbose >= 1) {
+        char *tmp = bytes2str (saltsize, salt);
+        verbose (1, "send_digests: salt = %s, digest = %s, checksum = %s\n"
+                  , tmp, digest, (checksum ? checksum : "(none)"));
+        free (tmp);
+    }
 
     tchecksum = (checksum ? checksum : "");
 
@@ -990,11 +993,11 @@ int send_getchecksum (struct wr_queue *pqueue)
 
 int send_checksum (struct wr_queue *pqueue, int len, unsigned char *buf)
 {
-    char *tmp = bytes2str (len, buf);
-
-    verbose (1, "send_checksum: checksum=%s\n", tmp);
-
-    free (tmp);
+    if (isverbose >= 1) {
+        char *tmp = bytes2str (len, buf);
+        verbose (1, "send_checksum: checksum=%s\n", tmp);
+        free (tmp);
+    }
 
     return add_wr_queue (pqueue, msg_checksum, (char *)buf, len);
 };
@@ -1145,7 +1148,6 @@ const char *get_string (char **msgbuf, size_t *msglen)
 
 int parse_digests (char *msgbuf, size_t msglen, int *saltsize, unsigned char **salt, char **dg_nm, hash_alg *dg_md, struct cs_state **cs_state)
 {
-    char       *tmp;
     const char *digest, *checksum;
 
     if (msglen < 1) {
@@ -1185,11 +1187,12 @@ int parse_digests (char *msgbuf, size_t msglen, int *saltsize, unsigned char **s
 
     *cs_state = (*checksum != '\0' ? init_checksum (checksum) : NULL);
 
-    tmp = bytes2str (*saltsize, *salt);
-    verbose (1, "parse_digests: salt = %s, digest = %s checksum = %s\n"
-            , tmp, digest, (*checksum == '\0' ? "(none)" : checksum));
-
-    free (tmp);
+    if (isverbose >= 1) {
+        char *tmp = bytes2str (*saltsize, *salt);
+        verbose (1, "parse_digests: salt = %s, digest = %s checksum = %s\n"
+                , tmp, digest, (*checksum == '\0' ? "(none)" : checksum));
+        free (tmp);
+    }
 
     return 0;
 };
@@ -1343,7 +1346,7 @@ int flush_checksum (struct cs_state **state, size_t *len, unsigned char **buf)
 
         hash_finish ((*state)->ctx, *buf);
 
-        {
+        if (isverbose >= 2) {
             char *tmp = bytes2str (*len, *buf);
             verbose (2, "flush_checksum: [%s]: %s\n", (*state)->name, tmp);
             free (tmp);
@@ -1359,36 +1362,6 @@ int flush_checksum (struct cs_state **state, size_t *len, unsigned char **buf)
     }
 
     return 0;
-}
-
-#define ZTYPE off64_t
-#define ZSTEP off64_t
-#define ZSIZE ((ZTYPE)(sizeof(ZSTEP) - 1))
-
-int is_zeroes (void *start, off64_t len)
-{
-    char  *cp1, *ep1, *cp2, *ep2;
-    ZTYPE *op;
-
-    cp1 = (char *) start;
-    ep1 = (char *)(((ZTYPE) (cp1 +       ZSIZE)) & ~ZSIZE);
-
-    cp2 = (char *)(((ZTYPE) (cp1 + len + ZSIZE)) & ~ZSIZE);
-    ep2 = cp1 + len;
-
-    op  = (off64_t *) ep1;
-
-    while (cp1 < ep1) {
-        if (*cp1++) return 0;
-    }
-    while (op < (off64_t *) cp2) {
-        if (*op++) return 0;
-    }
-    while (cp2 < ep2) {
-        if (*cp2++) return 0;
-    }
-
-    return 1;
 }
 
 int gen_hashes ( hash_alg md
@@ -1420,20 +1393,23 @@ int gen_hashes ( hash_alg md
 
         nrd = vpread (fd, fbuf, step, start, devsize);
 
-        verbose (3, "gen_hashes: hash: pos=%lld, len=%d\n"
-                , (long long) start, nrd);
-
 /* Kills performance; really slow syscall:
         posix_fadvise64 (fd, start + step, RDAHEAD, POSIX_FADV_WILLNEED);
 */
-
-        if (zh && is_zeroes (fbuf, step)) {
+        if (zh && checkzero (fbuf, step)) {
             memcpy (buf, zh->hash, zh->hashsize);
         } else {
             hash_init (dg_ctx, md);
             hash_update (dg_ctx, salt, saltsize);
             hash_update (dg_ctx, fbuf, nrd);
             hash_finish (dg_ctx, buf);
+        }
+
+        if (isverbose >= 3) {
+            char *tmp = bytes2str (hashsize, buf);
+            verbose (3, "gen_hashes: hash: pos=%lld, len=%d, hash=%s\n"
+                    , (long long) start, nrd, tmp);
+            free (tmp);
         }
         update_checksum (cs_state, start, fd, step, fbuf, devsize);
 
@@ -1472,9 +1448,9 @@ int do_server (int zeroblocks)
     size_t           msglen;
     unsigned char    token;
     unsigned char    *buf, *salt;
-    int              devfd, nstep;
+    int              devfd = -1, nstep;
     int              saltsize = 0;
-    off64_t          devsize, start, step;
+    off64_t          devsize = 0, start, step;
     size_t           len;
     struct           wr_queue wr_queue;
     struct           rd_queue rd_queue;
@@ -1520,7 +1496,7 @@ int do_server (int zeroblocks)
             break;
         case msg_gethashes:
             parse_gethashes (msg, msglen, &start, &step, &nstep);
-            zh = (zeroblocks ? find_zero_hash (dg_nm, step) : NULL);
+            zh = (zeroblocks ? find_zero_hash (dg_nm, step, saltsize, salt) : NULL);
             gen_hashes (dg_md, zh, cs_state, &rd_queue, &wr_queue, saltsize, salt, &buf, &len, devfd, devsize, start, step, nstep);
             send_hashes (&wr_queue, start, step, nstep, buf, len);
             free (buf);
@@ -1694,7 +1670,7 @@ int hashmatch ( const char *dg_nm
 
         free (msg);
 
-        zh = (zeroblocks ? find_zero_hash (dg_nm, rstep) : NULL);
+        zh = (zeroblocks ? find_zero_hash (dg_nm, rstep, saltsize, salt) : NULL);
         /* Generate our own list of hashes */
         gen_hashes (dg_md, zh, (rstep == hashstep ? cs_state : NULL)
                    , prd_queue, pwr_queue, saltsize, salt, &lhbuf, &lhsize, devfd, ldevsize, rstart, rstep, rnstep);
@@ -2009,11 +1985,11 @@ int do_patch (char *dev, int warndev, int diffsize)
                 verbose (0, "Bad data\n");
                 exit (1);
             }
+
             char *tmp = bytes2str (clen, cval);
-
             verbose (0, "checksum[%s]: %s\n", checksum, tmp);
-
             free (tmp);
+
             free (checksum);
             free (cval);
         }
